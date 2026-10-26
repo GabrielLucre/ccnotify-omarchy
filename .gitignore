@@ -1,0 +1,4 @@
+ccnotify.db
+ccnotify.log*
+config.json
+__pycache__/
