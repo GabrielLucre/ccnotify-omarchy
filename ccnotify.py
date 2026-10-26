@@ -270,30 +270,86 @@ class ClaudePromptTracker:
             logging.error(f"Error calculating duration: {e}")
             return "Unknown"
 
-    def send_notification(self, title, subtitle, cwd=None):
-        """Send macOS notification using terminal-notifier"""
-        from datetime import datetime
+    def parent_pid(self, pid):
+        """Read the parent PID of a process from /proc"""
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                stat = f.read()
+            # comm (field 2) may contain spaces/parens, so split after the last ')'
+            return int(stat[stat.rfind(")") + 2 :].split()[1])
+        except (OSError, ValueError, IndexError):
+            return 0
 
-        current_time = datetime.now().strftime("%B %d, %Y at %H:%M")
+    def find_terminal_window(self):
+        """Return the Hyprland address of the window that owns this Claude session"""
+        if not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+            return None
 
         try:
-            cmd = [
-                "terminal-notifier",
-                "-sound",
-                "default",
-                "-title",
-                title,
-                "-subtitle",
-                f"{subtitle}\n{current_time}",
-            ]
+            result = subprocess.run(
+                ["hyprctl", "clients", "-j"], capture_output=True, text=True, timeout=2
+            )
+            windows = {c["pid"]: c["address"] for c in json.loads(result.stdout)}
+        except Exception as e:
+            logging.warning(f"Could not list Hyprland windows: {e}")
+            return None
 
-            if cwd:
-                cmd.extend(["-execute", f'/usr/local/bin/code "{cwd}"'])
+        # Walk up the process tree: hook -> claude -> shell -> terminal window
+        pid = os.getppid()
+        while pid > 1:
+            if pid in windows:
+                return windows[pid]
+            pid = self.parent_pid(pid)
 
-            subprocess.run(cmd, check=False, capture_output=True)
+        return None
+
+    def send_notification(self, title, subtitle, cwd=None):
+        """Send desktop notification using notify-send (libnotify)"""
+        current_time = datetime.now().strftime("%B %d, %Y at %H:%M")
+
+        subtitle_lower = subtitle.lower()
+        urgency = (
+            "critical"
+            if "error" in subtitle_lower or "fail" in subtitle_lower
+            else "normal"
+        )
+
+        cmd = [
+            "notify-send",
+            "-a",
+            "Claude Code",
+            "-u",
+            urgency,
+            "-i",
+            "utilities-terminal",
+            title,
+            f"{subtitle}\n{current_time}",
+        ]
+
+        try:
+            window = self.find_terminal_window()
+            if window:
+                # Clicking the notification focuses the terminal running Claude.
+                # notify-send blocks until the notification closes, so run it
+                # detached to let the hook return immediately.
+                cmd.extend(["-A", "default=Focus terminal"])
+                script = (
+                    'addr="$1"; shift; action=$("$@"); '
+                    '[ "$action" = default ] && '
+                    'hyprctl dispatch focuswindow "address:$addr" >/dev/null'
+                )
+                subprocess.Popen(
+                    ["sh", "-c", script, "sh", window, *cmd],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            else:
+                subprocess.run(cmd, check=False, capture_output=True)
             logging.info(f"Notification sent: {title} - {subtitle}")
         except FileNotFoundError:
-            logging.warning("terminal-notifier not found, notification skipped")
+            logging.warning("notify-send not found (install libnotify), notification skipped")
         except Exception as e:
             logging.error(f"Error sending notification: {e}")
 
@@ -339,6 +395,13 @@ def main():
 
         expected_event_name = sys.argv[1]
         valid_events = ["UserPromptSubmit", "Stop", "Notification"]
+
+        # Manual test: ccnotify.py "Title" "Message"
+        if expected_event_name not in valid_events and len(sys.argv) >= 3:
+            ClaudePromptTracker().send_notification(
+                title=sys.argv[1], subtitle=sys.argv[2], cwd=os.getcwd()
+            )
+            return
 
         if expected_event_name not in valid_events:
             logging.error(f"Invalid hook type: {expected_event_name}")
