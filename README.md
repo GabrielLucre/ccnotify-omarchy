@@ -1,4 +1,4 @@
-![Notification Screenshot](alert.jpg)
+![Notification Screenshot](alert.png)
 
 # ccnotify-omarchy
 
